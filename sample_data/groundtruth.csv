@@ -1,0 +1,2 @@
+timestamp,level,cmdb_id,failure_type
+1647747326,service,recommendationservice,k8s容器网络资源包损坏

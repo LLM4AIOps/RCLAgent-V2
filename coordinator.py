@@ -1,12 +1,12 @@
 import json
-import sys
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from llm import chat_api
-from tools_claude import (
+from tools_gpt import (
     search_logs_function,
     search_fluctuating_metrics_function,
+    print_result_function  # 用于最终输出
 )
 
 base_tool_path = "http://127.0.0.1:5000"
@@ -23,7 +23,7 @@ def get_response(path, parameters):
     try:
         response = requests.get(url)
         return response.content.decode("utf-8")
-    except:
+    except Exception:
         return ""
 
 
@@ -38,178 +38,235 @@ class AgentPool:
         self.executor.shutdown(wait=True)
 
 
+# === 核心系统提示（所有 Agent 共享）===
+SYSTEM_PROMPT = """
+You are a Root Cause Localization (RCL) agent in a microservice system.
+A user-reported failure has occurred. Your task is to analyze logs and metrics 
+to identify the DEEPEST ROOT CAUSE SERVICE that initiated the failure chain.
+
+Guidelines:
+- Always assume the trace contains a real fault.
+- Focus on anomalies: errors, latency spikes, resource saturation, failed dependencies.
+- Prefer evidence from logs (e.g., exceptions) and metrics (e.g., CPU, error rate).
+- Do NOT blame the frontend unless evidence clearly points to it.
+- Return ONLY valid JSON when asked for structured output.
+"""
+
+
 class RCLAgent:
-    def __init__(self, span, raw, pool: AgentPool):
-        self.span = span
+    def __init__(self, span_id, raw, pool: AgentPool):
+        self.span_id = span_id
         self.raw = raw
         self.pool = pool
         self.children = []
         self.downstream_evidences = []
+        self.self_evidence = None
 
     def add_child(self, child_agent):
         self.children.append(child_agent)
 
     def self_state_verification(self):
-        """
-        Perform localized analysis on this span using logs and metrics.
-        """
+        """Analyze local logs/metrics for self-anomaly."""
         prompt = f"""
-        You are responsible for diagnosing the following span:
-        
-        {self.raw}
-        
-        Please perform self-state verification by:
-        1. Inspecting relevant logs.
-        2. Inspecting fluctuating metrics.
-        Summarize whether this span itself exhibits anomalous behavior.
-        Return a concise evidence object.
+        Analyze the following span for self-contained anomalies:
+
+        Span Data:
+        {json.dumps(self.raw, indent=2)}
+
+        Steps:
+        1. Use search_logs_function to fetch logs for this service around its timestamp.
+        2. Use search_fluctuating_metrics_function to check for metric spikes (latency, error rate, etc.).
+        3. Determine if THIS span shows symptoms of being faulty (e.g., errors, high latency, exceptions).
+
+        Return a concise evidence summary.
         """
-        prompts = [{"role": "user", "content": prompt}]
-        content, tools = chat_api(
-            prompts,
-            tools=[search_logs_function, search_fluctuating_metrics_function],
-        )
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
+        ]
+        content, tools = chat_api(messages, tools=[search_logs_function, search_fluctuating_metrics_function])
 
+        # Execute tool calls
         for tool in tools or []:
-            tool_result = get_response(tool["function"]["name"], tool["function"]["arguments"])
-            prompts.append({"role": "assistant", "content": tool_result})
+            tool_name = tool["function"]["name"]
+            tool_args = tool["function"]["arguments"]
+            tool_result = get_response(tool_name, tool_args)
+            messages.append({"role": "assistant", "content": tool_result})
 
-        final_prompt = """
-        Summarize the self-state evidence for this span in a compact JSON form:
+        # Final structured self-evidence
+        final_prompt = f"""
+        Based on ALL available information:
+        - Original Span Data:
+        {json.dumps(self.raw, indent=2)}
+        - Retrieved Logs and Metrics (if any)
+        Since this trace is confirmed to contain a failure, please analyze as thoroughly as possible whether the fault manifests within the current context.
+        """ + """
+        Summarize self-state evidence as JSON:
         {
-          "span": "...",
+          "span_id": "...",
+          "service_name": "...",
           "is_abnormal": true/false,
-          "key_symptoms": "...",
-          "hypothesis": "..."
+          "key_symptoms": "brief string",
+          "hypothesis": "why it might be faulty or not"
         }
         """
-        prompts.append({"role": "user", "content": final_prompt})
-        content, _ = chat_api(prompts)
+        messages.append({"role": "user", "content": final_prompt})
+        content, _ = chat_api(messages, None)
         return content
 
     def run(self):
-        """
-        Recursively run child agents in parallel, then consolidate evidences.
-        """
-        futures = []
-        for child in self.children:
-            futures.append(self.pool.submit(child.run))
+        """Run children in parallel, then consolidate."""
+        self.self_evidence = self.self_state_verification()
 
+        futures = [self.pool.submit(child.run) for child in self.children]
         for f in as_completed(futures):
-            self.downstream_evidences.append(f.result())
-
-        self_evidence = self.self_state_verification()
+            result = f.result()
+            if result:
+                self.downstream_evidences.append(result)
 
         consolidation_prompt = f"""
-        You are an agent responsible for span:
-        
-        {self.raw}
-        
-        Downstream evidences from children:
+        You are analyzing span: {self.raw}
+
+        Downstream evidences from children ({len(self.downstream_evidences)} items):
         {json.dumps(self.downstream_evidences, indent=2)}
-        
-        Your own self-state evidence:
-        {self_evidence}
-        
-        Please consolidate these evidences and output a compact hypothesis for your parent in JSON:
+
+        Your own self-evidence:
+        {self.self_evidence}
+
+        Task: Synthesize these into a LOCAL root cause hypothesis for your parent.
+        If any child shows strong evidence of being the root, propagate it upward.
+        Otherwise, if YOU are abnormal, propose yourself.
+
+        Output format (JSON only):
         {{
-          "span": "...",
-          "local_root_cause": "...",
+          "span_id": "...",
+          "service_name": "...",
+          "local_root_cause": "service name or 'self'",
           "reason": "...",
-          "confidence": 0-1
+          "confidence": 0.0-1.0
         }}
         """
-        prompts = [{"role": "user", "content": consolidation_prompt}]
-        content, _ = chat_api(prompts)
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": consolidation_prompt}
+        ]
+        content, _ = chat_api(messages, None)
         return content
 
 
-def build_agent_tree(trace_graph, pool):
-    """
-    trace_graph: a tree-like structure of spans
-    """
-    node = RCLAgent(trace_graph["span"], trace_graph["raw"], pool)
-    for child in trace_graph.get("children", []):
+def build_agent_tree(trace_node, pool):
+    """Recursively build agent tree from trace graph node."""
+    raw = trace_node.get("raw", {})
+    span_id = trace_node.get("span_id", "unknown")
+    agent = RCLAgent(span_id, raw, pool)
+
+    for child in trace_node.get("children", []):
         child_agent = build_agent_tree(child, pool)
-        node.add_child(child_agent)
-    return node
+        agent.add_child(child_agent)
+    return agent
 
 
 def inspect_trace(trace_graph, max_parallel_num=8):
     pool = AgentPool(max_parallel_num=max_parallel_num)
     root_agent = build_agent_tree(trace_graph, pool)
-
-    # 递归并行执行，得到 root-level evidence
-    root_evidence = root_agent.run()
+    intermediate_result = root_agent.run()  # populate self_evidence for all nodes
     pool.shutdown()
 
-    # Root-level global synthesis
-    root_prompt = f"""
-    You are the Root Agent responsible for producing the final diagnosis.
-    
-    Your goal is to identify the true root cause service and provide a clear,
-    actionable explanation based on all collected evidences.
-    
-    Root span:
-    {trace_graph.get("raw")}
-    
-    Root-level evidence:
-    {root_evidence}
-    
-    Please construct a global evidence graph implicitly from the above information
-    and return the final result in the following JSON format:
-    
-    {{
-      "root_cause_service": "...",
-      "root_span": "...",
-      "reason": "...",
-      "confidence": 0-1
-    }}
-    """
-    prompts = [{"role": "user", "content": root_prompt}]
-    final_content, _ = chat_api(prompts)
+    # === 新增：递归收集所有节点的 self_evidence ===
+    def collect_all_self_evidences(agent):
+        evidences = []
+        if agent.self_evidence:
+            evidences.append(agent.self_evidence)
+        for child in agent.children:
+            evidences.extend(collect_all_self_evidences(child))
+        return evidences
 
-    return final_content
+    all_self_evidences = collect_all_self_evidences(root_agent)
+
+    final_analysis_prompt = f"""
+You are the ROOT AGENT responsible for producing the FINAL diagnosis of a system failure.
+
+Your goal: Identify the single deepest root cause service that initiated the failure chain.
+
+Combine with Intermediate Summary and Trace Graph to analyze.
+
+Intermediate Summary: {intermediate_result}
+
+Trace Graph: {json.dumps(trace_graph, indent=2, ensure_ascii=False, default=str)}
+
+IMPORTANT: You MUST call the function `print_result_function`.
+
+To improve accuracy, consider exploring candidates around the most likely root cause. For example, if you identify `recommendationservice-2` as a potential root cause, you should also evaluate whether the true root lies at the pod level (`recommendationservice-2`), the service level (`recommendationservice`), or the node level (`node-6`). If the evidence is inconclusive, it is acceptable—and even encouraged—to include all plausible candidates in your output, prioritized by likelihood. When the evidence is inconclusive, prioritize candidates in the following order: **service** first, then **pod**, and finally **node**.
+
+Do not output anything else. Use the tool.
+"""
+    print(intermediate_result)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": final_analysis_prompt}
+    ]
+
+    content, tools = chat_api(
+        messages,
+        tools=[print_result_function]
+    )
+
+    if tools:
+        tool_call = tools[0]["function"]
+        args = tool_call["arguments"]
+        if isinstance(args, str):
+            try:
+                result_dict = json.loads(args)
+                return json.dumps(result_dict, ensure_ascii=False)
+            except:
+                return args
+        else:
+            return json.dumps(args, ensure_ascii=False)
+
+    return json.dumps({
+        "root_cause_service": "unknown",
+        "root_span": trace_graph.get("span_id", "unknown"),
+        "reason": "Model did not call print_result_function",
+        "confidence": 0.0
+    })
+
 
 def query_children(parent_span_id):
     url = f"{base_tool_path}/search_traces"
     try:
         r = requests.get(url, params={"parent_span_id": parent_span_id}, timeout=5)
-        data = r.json()
-        if isinstance(data, list):
-            return data
-        return []
+        text = r.text
+        text = text.replace('NaN', 'null').replace('Infinity', '"Infinity"')
+        data = json.loads(text)
+        return data if isinstance(data, list) else []
     except Exception as e:
         print(f"query_children failed for {parent_span_id}: {e}")
         return []
 
 
 def build_trace_graph(root_span_id, max_depth=20):
-    """
-    Recursively build a trace tree starting from root_span_id.
-    """
-
     def dfs(span_id, depth):
+        # Fetch span metadata (assume /search_traces returns full row including service_name, timestamp, etc.)
+        children_rows = query_children(span_id) if depth < max_depth else []
+
         node = {
             "span_id": span_id,
+            "raw": {"span_id": span_id},  # Placeholder; ideally fetched from a /get_span endpoint
             "children": []
         }
 
-        if depth >= max_depth:
-            return node
+        # Try to enrich raw with actual data (optional improvement)
+        # For now, we rely on children_rows having necessary fields
 
-        children_rows = query_children(span_id)
         for row in children_rows:
             child_span_id = row.get("span_id")
-            child_node = {
+            child_node = dfs(child_span_id, depth + 1)
+            child_node.update({
+                "raw": row,
                 "span_id": child_span_id,
                 "service_name": row.get("service_name"),
-                "timestamp": row.get("timestamp"),
-                "raw": row,
-                "children": []
-            }
-            # 递归展开
-            child_node = dfs(child_span_id, depth + 1) | child_node
+                "timestamp": row.get("timestamp")
+            })
             node["children"].append(child_node)
 
         return node
@@ -217,25 +274,38 @@ def build_trace_graph(root_span_id, max_depth=20):
     return dfs(root_span_id, 0)
 
 
-def inspect_all_traces(sub_path):
-    error_file_path = f"data/{sub_path}/hipstershop.Frontend/Recv._durations.txt"
+def inspect_all_traces():
+    error_file_path = f"sample_data/error_traces.txt"
     print(error_file_path)
-    fr = open(error_file_path, "r")
-    lines = fr.readlines()
+    try:
+        with open(error_file_path, "r") as fr:
+            lines = fr.readlines()
+    except Exception as e:
+        print(f"Failed to read {error_file_path}: {e}")
+        return
 
-    for i in range(1, len(lines)):
+    for i, line in enumerate(lines[1:], start=1):  # 跳过 header
         try:
-            root_span_id = lines[i]
-            trace_graph = build_trace_graph(root_span_id)
-            result = inspect_trace(trace_graph, max_parallel_num=8)
+            parts = line.strip().split()
+            if len(parts) < 3:
+                continue
+            root_span_id = parts[3].strip()  # span_id 是第4列
+            print(root_span_id)
+            if not root_span_id:
+                continue
 
-            conversation_file_path = f"data/{sub_path}/result/conversation_trace_{i}.txt"
+            trace_graph = build_trace_graph(root_span_id)
+            trace_graph.update({
+                "raw": line
+            })
+            result = inspect_trace(trace_graph, max_parallel_num=100)
+
+            conversation_file_path = f"sample_data/conversation_trace_{i}.txt"
             with open(conversation_file_path, 'w') as file:
                 file.write(str(result) + "\n")
         except Exception as e:
-            print(e)
-            i -= 1
+            print(f"Error processing line {i}: {e}")
 
 
 if __name__ == "__main__":
-    inspect_all_traces(sys.argv[1])
+    inspect_all_traces()
