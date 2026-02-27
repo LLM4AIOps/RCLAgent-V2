@@ -66,8 +66,8 @@ class RCLAgent:
         self.children.append(child_agent)
 
     def self_state_verification(self):
-        """Analyze local logs/metrics for self-anomaly."""
-        prompt = f"""
+        """Analyze local logs/metrics for self-anomaly using iterative tool reasoning."""
+        initial_prompt = f"""
         Analyze the following span for self-contained anomalies:
 
         Span Data:
@@ -78,41 +78,63 @@ class RCLAgent:
         2. Use search_fluctuating_metrics_function to check for metric spikes (latency, error rate, etc.).
         3. Determine if THIS span shows symptoms of being faulty (e.g., errors, high latency, exceptions).
 
-        Return a concise evidence summary.
+        You may use the provided tools iteratively. Only when you have enough evidence, produce a final JSON conclusion.
         """
+
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": initial_prompt}
         ]
-        content, tools = chat_api(messages, tools=[search_logs_function, search_fluctuating_metrics_function])
 
-        # Execute tool calls
-        for tool in tools or []:
-            tool_name = tool["function"]["name"]
-            tool_args = tool["function"]["arguments"]
-            tool_result = get_response(tool_name, tool_args)
-            messages.append({"role": "assistant", "content": tool_result})
+        available_tools = [search_logs_function, search_fluctuating_metrics_function]
+        tool_map = {tool["function"]["name"]: get_response for tool in available_tools}
 
-        # Final structured self-evidence
+        max_turns = 5  # prevent infinite loops
+        turn = 0
+
+        while turn < max_turns:
+            content, tool_calls = chat_api(messages, tools=available_tools)
+
+            # Otherwise, execute all requested tool calls
+            for tool_call in tool_calls:
+                tool_name = tool_call["function"]["name"]
+                try:
+                    tool_args = json.loads(tool_call["function"]["arguments"])
+                except (json.JSONDecodeError, TypeError):
+                    tool_args = {}
+
+                # Execute the tool
+                if tool_name in tool_map:
+                    tool_result = tool_map[tool_name](tool_name, tool_args)
+                else:
+                    tool_result = f"Error: Unknown tool '{tool_name}'"
+
+                # Append tool's response
+                messages.append({"role": "assistant", "content": tool_result})
+
+            turn += 1
+
+        # Fallback: after max turns, force final structured output
         final_prompt = f"""
         Based on ALL available information:
         - Original Span Data:
         {json.dumps(self.raw, indent=2)}
-        - Retrieved Logs and Metrics (if any)
+        - Retrieved Logs and Metrics (from prior tool responses)
+
         Since this trace is confirmed to contain a failure, please analyze as thoroughly as possible whether the fault manifests within the current context.
-        """ + """
-        Summarize self-state evidence as JSON:
-        {
+
+        Summarize self-state evidence as STRICT JSON (no markdown, no explanation):
+        {{
           "span_id": "...",
           "service_name": "...",
           "is_abnormal": true/false,
           "key_symptoms": "brief string",
           "hypothesis": "why it might be faulty or not"
-        }
+        }}
         """
         messages.append({"role": "user", "content": final_prompt})
-        content, _ = chat_api(messages, None)
-        return content
+        final_content, _ = chat_api(messages, tools=None)
+        return final_content.strip()
 
     def run(self):
         """Run children in parallel, then consolidate."""
