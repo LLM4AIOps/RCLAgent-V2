@@ -1,219 +1,230 @@
+"""
+tool_server.py – Flask data-API server for RCLAgent.
+
+Serves preprocessed trace, metric, and log data to RCLAgent's Dedicated
+Agents. ``DATA_ROOT``, host, and port are read from ``config.py`` and can
+be overridden via environment variables.
+
+Endpoints
+---------
+GET /search_span?span_id=<id>
+    Return the span row(s) matching span_id.
+
+GET /search_traces?parent_span_id=<id>
+    Return child spans whose parent_span == parent_span_id.
+
+GET /search_logs?service_name=<name>&timestamp=<unix>
+    Return non-INFO/DEBUG log lines for service_name within ±60 s of the
+    given timestamp.
+
+GET /search_fluctuating_metrics?service_name=<name>&timestamp=<unix>
+    Return KPIs showing a 3-sigma spike in the ±10 min window around the
+    given timestamp, measured against a ±20 min baseline.
+"""
+
 import os
 import pickle
-import sys
 
 import pandas as pd
 from flask import Flask, request, jsonify
 
-pd.set_option('display.max_rows', None)  # 不限制最大行数
-pd.set_option('display.max_columns', None)  # 不限制最大列数
-pd.set_option('display.width', None)  # 不限制显示宽度
-pd.set_option('display.max_colwidth', None)  # 不限制列宽
+import config
 
-app = Flask(__name__)
+pd.set_option("display.max_rows",     None)
+pd.set_option("display.max_columns",  None)
+pd.set_option("display.width",        None)
+pd.set_option("display.max_colwidth", None)
 
-def load_log_df():
-    """从 sample_data/log/all 目录加载所有日志文件并合并为 DataFrame"""
-    base_dir = f"sample_data/log/all"
-    if not os.path.exists(base_dir):
-        raise FileNotFoundError(f"Directory not found: {base_dir}")
-
-    files = [
-        os.path.join(base_dir, f)
-        for f in os.listdir(base_dir)
-        if f.endswith('.csv')
-    ]
-
-    if not files:
-        return pd.DataFrame(columns=['log_id', 'timestamp', 'cmdb_id', 'log_name', 'value'])
-
-    dfs = []
-    for file in files:
-        try:
-            df = pd.read_csv(file)
-            if 'value' in df.columns:
-                mask = ~df['value'].astype(str).str.lower().str.contains('info|debug', na=False)
-                df = df[mask]
-            dfs.append(df)
-        except Exception as e:
-            continue
-
-    if not dfs:
-        return pd.DataFrame(columns=['log_id', 'timestamp', 'cmdb_id', 'log_name', 'value'])
-
-    combined_df = pd.concat(dfs, ignore_index=True)
-    return combined_df
+app       = Flask(__name__)
+DATA_ROOT = config.DATA_ROOT
 
 
-# node-service
-fr = open(f"sample_data/metric/node_service_map.pkl", "rb")
-node_service_map = pickle.load(fr)
-fr = open(f"sample_data/metric/service_node_map.pkl", "rb")
-service_node_map = pickle.load(fr)
-# trace
-trace_df = pd.read_csv(f'sample_data/trace/all/trace_jaeger-span.csv')
-# metrics
-metric_df = pd.read_csv(f'sample_data/metric/all/metrics.csv')
-log_df = load_log_df()
+# ── Data loading ──────────────────────────────────────────────────────────────
+
+def _load_log_df() -> pd.DataFrame:
+    """Load log CSVs, skipping huge envoy logs (3GB+) that rarely help diagnosis."""
+    log_base = os.path.join(DATA_ROOT, "log")
+    frames   = []
+    for root, _, files in os.walk(log_base):
+        for fname in files:
+            if not fname.endswith(".csv"):
+                continue
+            # Skip envoy proxy logs — they're enormous and rarely contain
+            # root-cause signals; service application logs are sufficient.
+            if "envoy" in fname.lower():
+                print(f"  [log] skipping envoy log: {fname}")
+                continue
+            fpath = os.path.join(root, fname)
+            try:
+                print(f"  [log] loading {fname} ...")
+                df = pd.read_csv(fpath, low_memory=False)
+                if "value" in df.columns:
+                    noise = df["value"].astype(str).str.lower().str.contains(
+                        r"severity:\s*(?:info|debug)", regex=True, na=False
+                    )
+                    df = df[~noise]
+                frames.append(df)
+            except Exception as exc:
+                print(f"  [warn] skipping {fpath}: {exc}")
+    if not frames:
+        return pd.DataFrame(columns=["log_id", "timestamp", "cmdb_id", "log_name", "value"])
+    return pd.concat(frames, ignore_index=True)
 
 
-@app.route('/search_span', methods=['GET'])
-def search_span():
-    span_id = request.args.get('span_id')
-    if span_id is None:
-        return jsonify({"error": "span_id 参数缺失"}), 400
-
-    # 查找以该span_id为parent_span的行
-    result_rows = trace_df[trace_df['span_id'] == span_id]
-
-    if not result_rows.empty:
-        return jsonify(result_rows.to_dict(orient='records'))
-    else:
-        return jsonify({"message": "No trace with parent_span = '{span_id}' 。"}), 200
-
-
-@app.route('/search_traces', methods=['GET'])
-def search_traces():
-    span_id = request.args.get('parent_span_id')
-    if span_id is None:
-        return jsonify({"error": "span_id 参数缺失"}), 400
-
-    # 查找以该span_id为parent_span的行
-    result_rows = trace_df[trace_df['parent_span'] == span_id]
-
-    if not result_rows.empty:
-        return jsonify(result_rows.to_dict(orient='records'))
-    else:
-        return jsonify({"message": "No trace with parent_span = '{span_id}' 。"}), 200
-
-
-@app.route('/search_logs', methods=['GET'])
-def search_logs():
-    service_name = request.args.get('service_name')
-    timestamp_str = request.args.get('timestamp')
-
-    # 参数校验
-    if not service_name:
-        return jsonify({"error": "Missing required parameter: service_name"}), 400
-    if not timestamp_str:
-        return jsonify({"error": "Missing required parameter: timestamp"}), 400
-
+def _load_maps():
+    ns_path = os.path.join(DATA_ROOT, "metric", "node_service_map.pkl")
+    sn_path = os.path.join(DATA_ROOT, "metric", "service_node_map.pkl")
+    ns, sn  = {}, {}
     try:
-        # 截断并转换时间戳
-        if len(timestamp_str) > 10:
-            timestamp_str = timestamp_str[:10]
-        timestamp = int(timestamp_str)
+        with open(ns_path, "rb") as f:
+            ns = pickle.load(f)
+        with open(sn_path, "rb") as f:
+            sn = pickle.load(f)
+    except FileNotFoundError:
+        print(f"[warn] mapping pickles not found — run preprocessing_metrics.py first")
+    return ns, sn
+
+
+# ── Load once at startup ──────────────────────────────────────────────────────
+
+node_service_map, service_node_map = _load_maps()
+
+print("[tool_server] Loading trace data ...")
+trace_df  = pd.read_csv(os.path.join(DATA_ROOT, "trace",  "all", "trace_jaeger-span.csv"),
+                         dtype={"status_code": str}, low_memory=False)
+print("[tool_server] Loading metric data ...")
+metric_df = pd.read_csv(os.path.join(DATA_ROOT, "metric", "all", "metrics.csv"),
+                         low_memory=False)
+log_df    = _load_log_df()
+
+print(f"[tool_server] DATA_ROOT={DATA_ROOT}  spans={len(trace_df)}  "
+      f"metrics={len(metric_df)}  logs={len(log_df)}")
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+def _rows_to_json(rows: pd.DataFrame):
+    """Convert DataFrame rows to JSON-safe list (NaN -> None)."""
+    return rows.where(pd.notna(rows), None).to_dict(orient="records")
+
+
+@app.route("/search_span", methods=["GET"])
+def search_span():
+    span_id = request.args.get("span_id")
+    if not span_id:
+        return jsonify({"error": "span_id parameter missing"}), 400
+    rows = trace_df[trace_df["span_id"] == span_id]
+    if rows.empty:
+        return jsonify({"message": f"No span found with span_id={span_id}"}), 200
+    return jsonify(_rows_to_json(rows))
+
+
+@app.route("/search_traces", methods=["GET"])
+def search_traces():
+    parent_span_id = request.args.get("parent_span_id")
+    if not parent_span_id:
+        return jsonify({"error": "parent_span_id parameter missing"}), 400
+    rows = trace_df[trace_df["parent_span"] == parent_span_id]
+    if rows.empty:
+        return jsonify({"message": f"No child spans for parent_span={parent_span_id}"}), 200
+    return jsonify(_rows_to_json(rows))
+
+
+@app.route("/search_logs", methods=["GET"])
+def search_logs():
+    service_name  = request.args.get("service_name")
+    timestamp_str = request.args.get("timestamp")
+    if not service_name:
+        return jsonify({"error": "service_name parameter missing"}), 400
+    if not timestamp_str:
+        return jsonify({"error": "timestamp parameter missing"}), 400
+    try:
+        ts = int(str(timestamp_str)[:10])
     except ValueError:
         return jsonify({"error": "Invalid timestamp format"}), 400
 
-    # 计算时间范围（正负60秒）
-    start_time = timestamp - 60
-    end_time = timestamp + 60
+    filtered = log_df[
+        log_df["cmdb_id"].astype(str).str.contains(service_name, na=False) &
+        log_df["timestamp"].between(ts - 60, ts + 60)
+    ]
+    return filtered.to_csv(index=False)
 
+
+@app.route("/search_fluctuating_metrics", methods=["GET"])
+def search_fluctuating_metrics():
+    service_name  = request.args.get("service_name")
+    timestamp_str = request.args.get("timestamp")
+    if not service_name:
+        return jsonify({"error": "service_name parameter missing"}), 400
+    if not timestamp_str:
+        return jsonify({"error": "timestamp parameter missing"}), 400
     try:
-        # 使用 Pandas 查询符合条件的日志
-        filtered_df = log_df[
-            (log_df['cmdb_id'].str.contains(service_name, na=False)) &
-            (log_df['timestamp'] >= start_time) &
-            (log_df['timestamp'] <= end_time)
-            ]
+        ts = int(str(timestamp_str)[:10])
+    except ValueError:
+        return jsonify({"error": "Invalid timestamp format"}), 400
 
-        result = filtered_df.to_csv(index=False)
-        print(result)
-        return result
-    except Exception as e:
-        return jsonify({"error": "Internal server error", "details": str(e)}), 500
-
-
-@app.route('/search_fluctuating_metrics', methods=['GET'])
-def search_metrics():
-    service_name = request.args.get('service_name')
-    timestamp_str = request.args.get('timestamp')
-
-    if len(timestamp_str) > 10:
-        timestamp_str = timestamp_str[:10]
-    timestamp = int(timestamp_str)
-
-    node_id = None
-    if service_name in service_node_map:
-        node_id = service_node_map[service_name]
-
-        condition = (
+    node_id = service_node_map.get(service_name)
+    if node_id:
+        cond = (
+            (
+                metric_df["service_name"].str.contains(service_name, case=False, na=False) |
                 (
-                        (metric_df['service_name'].str.contains(service_name, case=False, na=False)) |
-                        (
-                                (metric_df['node_id'] == node_id) &
-                                (metric_df['service_name'] == "")
-                        )
-                ) &
-                (metric_df['timestamp'] >= timestamp - 1200) &
-                (metric_df['timestamp'] <= timestamp + 1200)
+                    (metric_df["node_id"] == node_id) &
+                    (metric_df["service_name"].fillna("") == "")
+                )
+            ) &
+            metric_df["timestamp"].between(ts - 1200, ts + 1200)
         )
     else:
-        condition = (
-                (metric_df['service_name'].str.contains(service_name, case=False, na=False)) &
-                (metric_df['timestamp'] >= timestamp - 1200) &
-                (metric_df['timestamp'] <= timestamp + 1200)
+        cond = (
+            metric_df["service_name"].str.contains(service_name, case=False, na=False) &
+            metric_df["timestamp"].between(ts - 1200, ts + 1200)
         )
 
-    result_rows = metric_df[condition]
-
-    if not result_rows.empty:
-        kpi_dict = dict()
-
-        for (kpi, node_id, service_name), group in result_rows.groupby(['kpi_name', 'node_id', 'service_name']):
-            mean_value = group['value'].mean()
-            std_dev_value = group['value'].std()
-            group = group[(group['timestamp'] >= timestamp - 600) & (group['timestamp'] <= timestamp + 600)]
-
-            if pd.notna(mean_value) and pd.notna(std_dev_value):
-                threshold = 3 * std_dev_value
-
-                is_fluctuating = (
-                        (group['value'] < (mean_value - threshold)) |
-                        (group['value'] > (mean_value + threshold))
-                ).any()
-
-                if is_fluctuating:
-                    # 初始化 key 为 kpi_name
-                    key = kpi  # 直接使用 kpi，因为 groupby 的 kpi_name 是唯一的
-
-                    # 如果 service_name 存在且不是 NaN，则添加到 key
-                    if not pd.isna(service_name):
-                        key = f"{service_name}.{key}"
-
-                    # 如果 node_id 存在且不是 NaN，则添加到 key
-                    if not pd.isna(node_id):
-                        key = f"{node_id}.{key}"
-
-                    # 将最终的 key 添加到集合中
-                    kpi_dict[key] = {
-                        "regular_mean": round(mean_value, 2),
-                        "regular_std_dev": round(std_dev_value, 2),
-                        "current_mean": round(group['value'].mean(), 2),
-                        "current_std_dev": round(group['value'].std(), 2),
-                    }
-
-        if len(kpi_dict) > 0:
-            table = []
-            header = ['key', 'regular_mean', 'regular_std_dev', 'current_mean', 'current_std_dev']
-            table.append(header)
-
-            for key, values in kpi_dict.items():
-                row = [key] + list(values.values())
-                table.append(row)
-
-            # 转换为 pandas DataFrame 以便于处理
-            df = pd.DataFrame(table[1:], columns=table[0])
-
-            # 打印为 CSV 格式
-            print(df.to_csv(index=False))
-            return df.to_csv(index=False)
-        else:
-            return jsonify({"message": "No fluctuating metrics found."}), 200
-    else:
+    baseline_df = metric_df[cond]
+    if baseline_df.empty:
         return jsonify({"message": "No matching records found."}), 200
 
+    kpi_dict = {}
+    for (kpi, nid, svc), group in baseline_df.groupby(["kpi_name", "node_id", "service_name"]):
+        mean_val = group["value"].mean()
+        std_val  = group["value"].std()
+        window   = group[group["timestamp"].between(ts - 600, ts + 600)]
+        if pd.isna(mean_val) or pd.isna(std_val) or std_val == 0:
+            continue
+        threshold = 3 * std_val
+        is_spike  = (
+            (window["value"] < mean_val - threshold) |
+            (window["value"] > mean_val + threshold)
+        ).any()
+        if not is_spike:
+            continue
+        key = kpi
+        if not pd.isna(svc) and svc:
+            key = f"{svc}.{key}"
+        if not pd.isna(nid) and nid:
+            key = f"{nid}.{key}"
+        kpi_dict[key] = {
+            "regular_mean":    round(mean_val, 2),
+            "regular_std_dev": round(std_val, 2),
+            "current_mean":    round(window["value"].mean(), 2),
+            "current_std_dev": round(window["value"].std(), 2),
+        }
 
-if __name__ == '__main__':
-    app.run(debug=False)
+    if not kpi_dict:
+        return jsonify({"message": "No fluctuating metrics found."}), 200
+
+    rows   = [["key", "regular_mean", "regular_std_dev", "current_mean", "current_std_dev"]]
+    rows  += [[k] + list(v.values()) for k, v in kpi_dict.items()]
+    df_out = pd.DataFrame(rows[1:], columns=rows[0])
+    return df_out.to_csv(index=False)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    app.run(
+        host=config.TOOL_SERVER_HOST,
+        port=config.TOOL_SERVER_PORT,
+        debug=False,
+    )

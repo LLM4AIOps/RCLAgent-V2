@@ -1,2 +1,2 @@
-             timestamp      cmdb_id           span_id                          trace_id  duration  type status_code              operation_name parent_span
-1748157  1647747340693   frontend-2  d1b3f238e544e3f0  ae265c5b07acfe6cb3548eb855aa1357  13385835  http           0  hipstershop.Frontend/Recv.         NaN
+       timestamp     cmdb_id           span_id                          trace_id  duration  type status_code              operation_name parent_span
+0  1647747340693  frontend-2  d1b3f238e544e3f0  ae265c5b07acfe6cb3548eb855aa1357  13385835  http           0  hipstershop.Frontend/Recv.         NaN

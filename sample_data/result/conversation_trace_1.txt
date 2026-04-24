@@ -1,0 +1,15 @@
+{
+  "root_causes": [
+    "recommendationservice-1",
+    "productcatalogservice-1",
+    "frontend-2",
+    "recommendationservice",
+    "productcatalogservice",
+    "currencyservice-0",
+    "currencyservice-1",
+    "adservice-0",
+    "cartservice-2",
+    "node-3",
+    "node-5"
+  ]
+}
