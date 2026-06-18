@@ -213,13 +213,13 @@ DATA_ROOT=data/2022-03-20-cloudbed2 TOOL_SERVER_PORT=5001 DATASET_TYPE=aiops2022
 Switch `DATA_ROOT` and `DATASET_TYPE` accordingly:
 
 ```bash
-# Augmented-TrainTicket (Nezha-30) — deeper trace graphs, cap depth at 10
+# Augmented-TrainTicket (Nezha-30)
 DATA_ROOT=data/nezha-2023-01-30 TOOL_SERVER_PORT=5002 DATASET_TYPE=nezha \
-MAX_TRACE_DEPTH=10 MAX_AGENT_PARALLEL=16 \
+MAX_AGENT_PARALLEL=16 \
     python3 tool_server.py &
 
 DATA_ROOT=data/nezha-2023-01-30 TOOL_SERVER_PORT=5002 DATASET_TYPE=nezha \
-MAX_TRACE_DEPTH=10 MAX_AGENT_PARALLEL=16 \
+MAX_AGENT_PARALLEL=16 \
     python3 coordinator.py
 ```
 
@@ -343,9 +343,7 @@ All settings are read from environment variables (falling back to defaults in `c
 | `TOOL_SERVER_PORT` | `5000` | Tool Server port |
 | `DATASET_TYPE` | `aiops2022` | One of `aiops2022`, `nezha`, `re2ob` |
 | `MAX_AGENT_PARALLEL` | `32` | Max concurrent Dedicated Agents |
-| `MAX_TOOL_TURNS` | `5` | Max tool-call rounds per agent |
-| `MAX_TRACE_DEPTH` | `20` | Max trace graph depth (use 10 for Nezha) |
-| `DURATION_THRESHOLD_US` | `10000000` | Span duration threshold (µs) for error-trace selection |
+| `DURATION_THRESHOLD_US` | `10000000` | Configurable span-duration threshold (µs) used by preprocessing to select slow/error traces |
 
 ---
 

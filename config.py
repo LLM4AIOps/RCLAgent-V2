@@ -36,8 +36,6 @@ TOOL_SERVER_URL  = f"http://{TOOL_SERVER_HOST}:{TOOL_SERVER_PORT}"
 # Max concurrent Dedicated Agents. When running multiple subsets in parallel,
 # keep this moderate to avoid LLM rate-limit errors.
 MAX_AGENT_PARALLEL = int(os.environ.get("MAX_AGENT_PARALLEL", "32"))
-MAX_TOOL_TURNS     = int(os.environ.get("MAX_TOOL_TURNS",     "5"))
-MAX_TRACE_DEPTH    = int(os.environ.get("MAX_TRACE_DEPTH",    "20"))
 
 # ── Dataset type ─────────────────────────────────────────────────────────────
 # One of: "aiops2022" | "nezha" | "re2ob"

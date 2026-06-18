@@ -151,27 +151,7 @@ Pods have K8s names like ts-contacts-service-866bd68c97-xcqfx.
 When identifying root causes, use the SERVICE name (e.g. "ts-contacts-service"),
 not the full pod name.
 
-EVIDENCE PRIORITY (CRITICAL — follow this ranking strictly):
-1. **ERROR/EXCEPTION logs** are the STRONGEST evidence of a root cause.
-   A service with error logs (e.g. "severity: error", stack traces, exceptions)
-   should ALWAYS be ranked above services with only latency anomalies.
-2. **Abnormal CPU/memory metrics** (current_mean >> regular_mean) are moderate evidence.
-3. **High latency alone is WEAK evidence** — many services (especially ts-seat-service,
-   ts-config-service, ts-basic-service) are naturally slow or frequently called.
-   High latency usually means the service is a VICTIM of a downstream fault, not
-   the root cause itself.
-
-COMMON FALSE POSITIVES to avoid:
-- ts-seat-service: Naturally slow (seat availability computation). Almost NEVER
-  the root cause. Only rank it first if it has actual ERROR logs.
-- ts-config-service: Frequently called utility service. Rarely the root cause.
-- ts-basic-service: Often shows latency because it fans out to many services.
-  Only the root cause if it has ERROR logs itself.
-- ts-gateway-service, ts-preserve-service, ts-preserve-other-service: Upper-level
-  orchestrators that propagate downstream failures.
-
-Fault types in this system: return-value corruption (wrong data returned, shown
-as error logs), exceptions, cpu_contention, network_delay.
+Use the available trace, metric, and log evidence to infer the most likely root-cause service. Do not rely on dataset-specific service priors; rank candidates only according to the evidence observed in the current failure instance.
 """,
     "re2ob": """
 You are a Root Cause Localization (RCL) agent in a microservice system.
@@ -259,13 +239,24 @@ JSON conclusion (no markdown):
         tools      = [search_logs_function, search_fluctuating_metrics_function]
         tool_names = {t["function"]["name"] for t in tools}
 
-        for _ in range(config.MAX_TOOL_TURNS):
+        seen_tool_requests = set()
+        while True:
             content, tool_calls = chat_api(messages, tools=tools)
 
             if not tool_calls:
                 if content.strip():
                     return content.strip()
                 break
+
+            # Stop only if the model repeats the exact same tool request, which
+            # indicates a protocol loop rather than useful additional evidence.
+            request_signature = tuple(
+                (tc.get("function", {}).get("name", ""), tc.get("function", {}).get("arguments", ""))
+                for tc in tool_calls
+            )
+            if request_signature in seen_tool_requests:
+                break
+            seen_tool_requests.add(request_signature)
 
             # ── correct OpenAI multi-turn tool-call protocol ──
             messages.append({
@@ -341,23 +332,25 @@ CRITICAL REASONING RULES:
 
 # ── Trace graph construction ──────────────────────────────────────────────────
 
-def build_trace_graph(root_span_id: str, max_depth: int = config.MAX_TRACE_DEPTH) -> dict:
+def build_trace_graph(root_span_id: str) -> dict:
     root_raw = _fetch_span(root_span_id)
+    visited = set()
 
-    def dfs(span_id: str, raw: dict, depth: int) -> dict:
+    def dfs(span_id: str, raw: dict) -> dict:
         node = {"span_id": span_id, "raw": raw, "children": []}
-        if depth >= max_depth:
+        if span_id in visited:
             return node
+        visited.add(span_id)
         seen_ids = set()
         for child_row in _query_children(span_id):
             child_id = child_row.get("span_id")
             if not child_id or child_id in seen_ids:
                 continue
             seen_ids.add(child_id)
-            node["children"].append(dfs(child_id, child_row, depth + 1))
+            node["children"].append(dfs(child_id, child_row))
         return node
 
-    return dfs(root_span_id, root_raw, 0)
+    return dfs(root_span_id, root_raw)
 
 
 def build_agent_tree(trace_node: dict, pool: AgentPool, geg: GlobalEvidenceGraph) -> DedicatedAgent:
@@ -500,17 +493,11 @@ Global Evidence Graph ({len(geg._nodes)} span evidences collected):
 
 Goal: identify the root-cause service.
 
-CRITICAL RANKING RULES (follow strictly):
-1. Services with ERROR/EXCEPTION LOGS should be ranked FIRST. Error logs are
-   the strongest indicator of a root cause in microservice fault diagnosis.
-2. Services with only metric anomalies (no error logs) rank SECOND.
-3. Services with only high latency (no error logs, no metric anomalies) rank LAST.
-   High latency almost always means the service is a VICTIM, not the cause.
-4. Among services with error logs, prefer the DEEPEST one in the call chain.
-5. NEVER rank ts-seat-service, ts-config-service, or ts-gateway-service first
-   unless they have actual ERROR LOGS — these are commonly slow but rarely root causes.
-6. Consider all three granularity levels: service, pod, node.
-7. You MUST call the `print_results` function with at least 10 candidates.
+Ranking instructions:
+1. Rank candidates according to the evidence observed in the current trace, metrics, and logs.
+2. Prefer components whose abnormal evidence can causally explain upstream symptoms.
+3. Consider all three granularity levels: service, pod, node.
+4. You MUST call the `print_results` function with at least 10 candidates.
    Do not output anything else."""
 
     messages = [
@@ -545,8 +532,7 @@ CRITICAL RANKING RULES (follow strictly):
             "raw_content": content,
         }
 
-    # Post-processing: evidence-based re-ranking for Nezha
-    return _evidence_rerank(result, trace_graph)
+    return result
 
 
 # ── Evidence-based re-ranking (Nezha post-processing) ────────────────────────
@@ -617,76 +603,6 @@ def _collect_trace_services(trace_graph: dict) -> set:
             _walk(child)
     _walk(trace_graph)
     return services
-
-
-_FALSE_POSITIVE_SERVICES = {"ts-seat-service", "ts-config-service", "ts-gateway-service"}
-
-
-def _query_error_log_count(service_name: str, timestamp: int, widen: bool = True) -> int:
-    """Query tool server for error log count. Optionally checks wider time windows."""
-    offsets = [0, 60, 120] if widen else [0]
-    for offset in offsets:
-        try:
-            log_resp = _get("search_logs", {"service_name": service_name, "timestamp": timestamp + offset})
-            count = sum(1 for line in log_resp.split("\n")
-                        if "error" in line.lower() and line.strip() and not line.startswith("log_id"))
-            if count > 0:
-                return count
-        except Exception:
-            pass
-    return 0
-
-
-def _evidence_rerank(result: dict, trace_graph: dict) -> dict:
-    """
-    For Nezha dataset: re-rank candidates using two signals:
-    1. Network overhead boost: if parent call >> child span duration (>500ms gap),
-       the child likely has network_delay — boost it strongly.
-    2. False-positive demotion: ts-seat-service, ts-config-service, ts-gateway-service
-       are demoted unless they have error logs (rarely the actual root cause).
-    Error logs alone are NOT used as a boost signal because for network_delay faults
-    (the most common type), error logs appear in calling services, not the fault service.
-    """
-    if config.DATASET_TYPE != "nezha":
-        return result
-
-    rcs = result.get("root_causes", [])
-    if not rcs:
-        return result
-
-    root_raw = trace_graph.get("raw", {})
-    ts_ms = root_raw.get("timestamp", 0)
-    ts = int(str(ts_ms)[:10]) if ts_ms else 0
-    if not ts:
-        return result
-
-    # Compute network overhead for each service in the trace graph
-    overhead = _compute_network_overhead(trace_graph)
-
-    # Score each candidate
-    scored = []
-    for i, rc in enumerate(rcs):
-        score = len(rcs) - i  # Base score from LLM ranking
-        rc_b = _svc_base(rc)
-
-        # Network overhead boost (primary signal for network_delay faults)
-        net_oh = overhead.get(rc_b, 0)
-        if net_oh > 1_000_000:    # > 1 second
-            score += 60
-        elif net_oh > 500_000:    # > 500ms
-            score += 40
-
-        # Demotion for known false positives (only if no error logs)
-        error_count = _query_error_log_count(rc_b, ts, widen=(rc_b not in _FALSE_POSITIVE_SERVICES))
-        if error_count == 0 and rc_b in _FALSE_POSITIVE_SERVICES:
-            score -= 30
-
-        scored.append((rc, score))
-
-    # Sort by score (descending)
-    scored.sort(key=lambda x: -x[1])
-    result["root_causes"] = [rc for rc, _ in scored]
-    return result
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
